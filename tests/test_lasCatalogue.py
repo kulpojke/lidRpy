@@ -7,13 +7,13 @@ sys.path.append('../src')
 
 
 def test_import():
-    global pydr
-    import pydr
+    global lidrpy
+    import lidrpy
 
 
 def test_init(data_dir):
-    print('Initiating pydR instance...')
-    ctg = pydr.lasCatalogue(data_dir)
+    print('Initiating lidrpy instance...')
+    ctg = lidrpy.lasCatalogue(data_dir)
     assert len(ctg.files()) == 4
     print('...done.\n')
     return ctg
