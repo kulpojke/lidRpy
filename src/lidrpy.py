@@ -22,22 +22,54 @@ from tqdm.auto import tqdm
 from tqdm.contrib.concurrent import process_map, thread_map
 from numba import vectorize, float32, float64, boolean
 
+import tempfile
+from osgeo import gdal
+
+import time
+import platform
+import warnings
+from math import floor
+from pathlib import Path
+
+
+import scipy.ndimage as ndimage
+import scipy.ndimage.filters as filters
+from scipy.spatial.distance import cdist
+
+from skimage.segmentation import watershed
+from skimage.filters import threshold_otsu
+# from skimage.feature import peak_local_max
+
+from shapely.geometry import mapping, Point, Polygon
+
+from rasterio.features import shapes as rioshapes
+
+import fiona
+from fiona.crs import from_epsg
 
 #%%
+class NoTreesException(Exception):
+    """ Raised when no tree detected """
+    pass
+
 
 class lasCatalogue:
     '''docstring'''
 
-    def __init__(self, data_dir, tilesize=500):
+    def __init__(self, data_dir, tile_size=2000):
         self.data_dir = data_dir
         self.parquet_dir = os.path.join(
             os.path.dirname(self.data_dir),
             'parquets')
         self.__inbox_func = None
-        self.tilesize = tilesize
+        self.tile_size = tile_size
+        self.buffer = 15
+        self.resolution = 0.5
+        self.chm_path = None
         self.files = []
         self.__see_what_files(self.data_dir)
         self.lazy = []
+        self.trees = []
 
         # transient to hold the pq file names from __las_to_parquet
         # for use in __make_parquet_map
@@ -215,7 +247,7 @@ class lasCatalogue:
         returns a single Pandas DataFrame.
         '''
 
-        # no need for more cpu's then files
+        # no need for more CPUs then files
         if len(files) < n_concurrent_files:
             n_concurrent_files = len(files)
 
@@ -258,6 +290,90 @@ class lasCatalogue:
         return df
 
 
+    def __buffer_tiles(self, bbox):
+        '''Returns a list of  of buffered tiles as [xmin, xmax, ymin, ymax]'''
+        # break bbox up into buffered tiles
+        x_grid = np.arange(bbox[0], bbox[1], self.tile_size)
+        y_grid = np.arange(bbox[2], bbox[3], self.tile_size)
+
+        boxes = []
+        for i, x in enumerate(x_grid):
+            for j, y in enumerate(y_grid):
+                if i == 0:
+                    b0 = x
+                else:
+                    b0 = x - self.buffer
+                
+                b1 = x + self.tile_size + self.buffer
+
+                if j == 0:
+                    b2 = y
+                else:
+                    b2 = y - self.buffer
+
+                b3 = y + self.tile_size + self.buffer
+
+                boxes.append([b0, b1, b2, b3])
+
+        return boxes
+
+
+    def __df_to_xyHAG_arr(self, df):
+        '''
+        Takes a pandas df, returns a Numpy array of only X, Y, HAG:
+        
+        array([[ x0, y0, hag0 ],
+               [ x1, y1, hag1 ],
+               ...,
+               [ xn, yn, hagn ]])
+        
+        for for use with open3d or sklearn (or other).
+        '''
+        #TODO: is this wrapper pointless?
+        return df[['X', 'Y', 'HeightAboveGround']].to_numpy()
+
+
+    
+    def __df_to_structured_arr(self, df):
+        '''
+        Takes a pandas df, returns a Numpy structured array suitable
+        for feeding to pdal
+        '''
+        s = df.dtypes
+        arr = np.array(
+            [tuple(x) for x in df.values],
+            dtype=list(zip(s.index, s)))
+
+        return arr
+
+
+    @staticmethod
+    def _get_kernel(radius=5, circular=False):
+        """ returns a block or disc-shaped filter kernel with given radius
+        Parameters
+        ----------
+        radius :    int, optional
+                    radius of the filter kernel
+        circular :  bool, optional
+                    set to True for disc-shaped filter kernel, block otherwise
+        Returns
+        -------
+        ndarray
+            filter kernel
+        """
+        if circular:
+            y, x = np.ogrid[-radius:radius+1, -radius:radius+1]
+            return x**2 + y**2 <= radius**2
+        else:
+            return np.ones((int(radius), int(radius)))
+
+
+    def _pixel_to_geo(self, pix_x, pix_y, resolution):
+        ''' Convert pixel coordinates to projected coordinates
+        '''
+        x = self.x_transform + (pix_x * resolution)
+        y = self.y_transform - (pix_y * resolution)
+        return x, y
     # -------------------- public methods ------------------------------------
 
     def make_parquets(self):
@@ -277,7 +393,6 @@ class lasCatalogue:
     def read_from_bbox(self, bbox):
         ''''''
         files = self.__find_needed_parquets(bbox)
-        print(f'number of files: {len(files)}')
         df = self.read_parquet(files)
 
         func = self. __make_inbox_func(bbox)
@@ -290,14 +405,131 @@ class lasCatalogue:
         return df
 
 
-def make_chm(self, bbox, tilesize=1000):
-    '''
-    
-    '''
-    # break bbox up into buffered tiles
+    def make_chm(self, bbox, save_dir=None):
+        '''
+        TODO: should we use the same tile_size for tiffs?
+        '''
+        # buffer tiles
+        buf_tiles = self.__buffer_tiles(bbox)
 
-    # makes chm from tiles, put into a directory
+        # make place to save
+        if not save_dir:
+            # make a tmp directory that will be destroyed when we are done
+            self._chm_tmp = tempfile.TemporaryDirectory()
+            save_dir = self._chm_tmp.name 
+        os.makedirs(save_dir, exist_ok=True)
+        
+        for i, tile in enumerate(buf_tiles):
+            # read points in tile
+            df = self.read_from_bbox(tile)
+            # make df into arr for pdal
+            arr = self.__df_to_structured_arr(df)
+            # make path 
+            filename=os.path.join(save_dir, f'chm_{i}.tif')
+            # make pipe
+            pipeline = pdal.Writer.gdal(
+                filename=filename,
+                resolution=self.resolution,
+                output_type='mean',
+                dimension='HeightAboveGround'
+                ).pipeline(arr)
+            pipeline.execute()
 
-    # build a vrt wfrom overlaping tiles
+        # build a vrt from overlaping tiles
+        vsi_hrefs = [os.path.join(save_dir, f) for f in os.listdir(save_dir)]
+        vrt = os.path.join(save_dir, 'chm.vrt')
+        _ = gdal.BuildVRT(vrt, vsi_hrefs)
+        _ = None
 
-    # return vrt
+        self.chm_path = vrt
+                
+        return vrt
+
+
+    def tree_detection(self, raster=None, resolution=None, ws=5, hmin=3,
+                        return_trees=False, ws_in_pixels=False):
+            ''' Detect individual trees from CHM raster based on a maximum filter.
+            Identified trees are either stores as list in the tree dataframe or
+            returned as ndarray.
+            Parameters
+            ----------
+            raster :        str, optional
+                            path to raster of height values (e.g., CHM)
+            resolution :    int, optional
+                            resolution of raster in m
+            ws :            float
+                            moving window size (in metre) to detect the local maxima
+            hmin :          float
+                            Minimum height of a tree. Threshold below which a pixel
+                            or a point cannot be a local maxima
+            return_trees :  bool
+                            set to True if detected trees shopuld be returned as
+                            ndarray instead of being stored in tree dataframe
+            ws_in_pixels :  bool
+                            sets ws in pixel
+            Returns
+            -------
+            ndarray (optional)
+                nx2 array of tree top pixel coordinates
+
+            Modified fom:
+            Zörner, J.; Dymond, J.; Shepherd J.; Jolly, B.
+            PyCrown - Fast raster-based individual tree segmentation for LiDAR data.
+            Landcare Research NZ Ltd. 2018, https://doi.org/10.7931/M0SR-DN55
+            '''
+
+            # read raster as array
+            raster = raster if raster else self.chm_path
+            chm_gdal = gdal.Open(raster, gdal.GA_ReadOnly)  
+            raster = chm_gdal.GetRasterBand(1).ReadAsArray()
+
+
+            # get geotransform
+            geotransform = chm_gdal.GetGeoTransform()
+            self.x_transform = geotransform[0]
+            self.y_transform = geotransform[3]
+            chm_gdal = None
+
+            # TODO: should we just read the resolution from the raster?
+            resolution = resolution if resolution else self.resolution
+
+            if not ws_in_pixels:
+                if ws % resolution:
+                    raise Exception("Image filter size not an integer number. Please check if image resolution matches filter size (in metre or pixel).")
+                else:
+                    ws = int(ws / resolution)
+
+            # Maximum filter to find local peaks
+            raster_maximum = filters.maximum_filter(
+                raster, footprint=self._get_kernel(ws, circular=True))
+            tree_maxima = raster == raster_maximum
+
+            # remove tree tops lower than minimum height
+            tree_maxima[raster <= hmin] = 0
+
+            # label each tree
+            self.tree_markers, num_objects = ndimage.label(tree_maxima)
+
+            if num_objects == 0:
+                raise NoTreesException
+
+            # if canopy height is the same for multiple pixels,
+            # place the tree top in the center of mass of the pixel bounds
+            yx = np.array(
+                    ndimage.center_of_mass(
+                        raster, self.tree_markers, range(1, num_objects+1)
+                    ), dtype=np.float32
+                ) + 0.5
+            xy = np.array((yx[:, 1], yx[:, 0])).T
+
+            trees = [Point(*self._pixel_to_geo(xy[tidx, 0], xy[tidx, 1], resolution))
+                    for tidx in range(len(xy))]
+
+            df = pd.DataFrame(np.array([trees, trees], dtype='object').T,
+                                dtype='object', columns=['top_cor', 'top'])
+            self.trees.append(df)
+
+            if return_trees:
+                return np.array(trees, dtype=object), xy
+            
+            
