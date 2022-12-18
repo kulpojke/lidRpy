@@ -64,16 +64,19 @@ test_make_parquets(ctg)
 t = time() - t0
 print(f'It took {round(t/60, 2)} minutes to build parquets. ')
 
-df, df2 = test_parquet_reading(ctg)
+#df, df2 = test_parquet_reading(ctg)
+
+#t = time() - t
+#print(f'It took {round(t/60, 2)} minutes to read all parquets and then read from bbox . ')
+
+ctg.make_chm(bbox,
+    save_dir='/home/michael/work/lidRpy/tmp',
+    make_dem=True,
+    dem_dir='/home/michael/work/lidRpy/dem_tmp'
+    )
 
 t = time() - t
-print(f'It took {round(t/60, 2)} minutes to read all parquets and then read from bbox . ')
-
-
-vrt = ctg.make_chm(bbox, save_dir='/home/michael/work/lidRpy/tmp')
-
-t = time() - t
-print(f'It took {round(t/60, 2)} minutes to build chm from bbox . ')
+print(f'It took {round(t/60, 2)} minutes to build chm and dem from bbox . ')
 
 
 ctg.tree_detection()

@@ -20,7 +20,7 @@ from functools import partial
 import pyarrow as pa
 from tqdm.auto import tqdm
 from tqdm.contrib.concurrent import process_map, thread_map
-from numba import vectorize, float32, float64, boolean
+from numba import vectorize, jit, float32, float64, boolean, float_, int32
 
 import tempfile
 from osgeo import gdal
@@ -405,7 +405,7 @@ class lasCatalogue:
         return df
 
 
-    def make_chm(self, bbox, save_dir=None):
+    def make_chm(self, bbox, save_dir=None, make_dem=False, dem_dir=None):
         '''
         TODO: should we use the same tile_size for tiffs?
         '''
@@ -419,6 +419,17 @@ class lasCatalogue:
             save_dir = self._chm_tmp.name 
         os.makedirs(save_dir, exist_ok=True)
         
+        # to hol filenames for buildvrt
+        chm_vsi_hrefs = []
+
+        if make_dem:
+                if not dem_dir:
+                    # make a tmp directory that will be destroyed when we are done
+                    self._dem_tmp = tempfile.TemporaryDirectory()
+                    dem_dir = self._dem_tmp.name 
+                os.makedirs(dem_dir, exist_ok=True)
+                dem_vsi_hrefs = []
+
         for i, tile in enumerate(buf_tiles):
             # read points in tile
             df = self.read_from_bbox(tile)
@@ -426,27 +437,43 @@ class lasCatalogue:
             arr = self.__df_to_structured_arr(df)
             # make path 
             filename=os.path.join(save_dir, f'chm_{i}.tif')
+            chm_vsi_hrefs.append(filename)
             # make pipe
             pipeline = pdal.Writer.gdal(
                 filename=filename,
                 resolution=self.resolution,
                 output_type='mean',
-                dimension='HeightAboveGround'
+                dimension='HeightAboveGround',
+                window_size=5
                 ).pipeline(arr)
+            if make_dem:
+                filename=os.path.join(dem_dir, f'dem_{i}.tif')
+                dem_vsi_hrefs.append(filename)
+                pipeline |= pdal.Filter.range(limits='Classification[2:2]')
+                pipeline |= pdal.Writer.gdal(
+                    filename=filename,
+                    resolution=self.resolution,
+                    output_type='mean',
+                    window_size=5
+                    )
+
             pipeline.execute()
 
-        # build a vrt from overlaping tiles
-        vsi_hrefs = [os.path.join(save_dir, f) for f in os.listdir(save_dir)]
-        vrt = os.path.join(save_dir, 'chm.vrt')
-        _ = gdal.BuildVRT(vrt, vsi_hrefs)
+        # build a vrt from overlaping chm  tiles
+        chm_vrt = os.path.join(save_dir, 'chm.vrt')
+        _ = gdal.BuildVRT(chm_vrt, chm_vsi_hrefs)
         _ = None
+        self.chm_path = chm_vrt
 
-        self.chm_path = vrt
-                
-        return vrt
+        if make_dem:
+            # build a vrt from overlaping tiles
+            dem_vrt = os.path.join(dem_dir, 'dem.vrt')
+            _ = gdal.BuildVRT(dem_vrt, dem_vsi_hrefs)
+            _ = None
+            self.dem_path = dem_vrt
+        
 
-
-    def tree_detection(self, raster=None, resolution=None, ws=5, hmin=3,
+    def tree_detection(self, raster=None, resolution=None, ws=10, hmin=3,
                         return_trees=False, ws_in_pixels=False):
             ''' Detect individual trees from CHM raster based on a maximum filter.
             Identified trees are either stores as list in the tree dataframe or
@@ -501,7 +528,10 @@ class lasCatalogue:
 
             # Maximum filter to find local peaks
             raster_maximum = filters.maximum_filter(
-                raster, footprint=self._get_kernel(ws, circular=True))
+                raster,
+                footprint=self._get_kernel(ws, circular=True)
+                )
+
             tree_maxima = raster == raster_maximum
 
             # remove tree tops lower than minimum height
