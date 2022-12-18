@@ -15,6 +15,7 @@ import os
 import shutil
 from pathlib import Path
 import json
+import rasterio as rio
 
 from functools import partial
 import pyarrow as pa
@@ -66,6 +67,8 @@ class lasCatalogue:
         self.buffer = 15
         self.resolution = 0.5
         self.chm_path = None
+        self.dem_path = None
+        self.smooth_chm_path = None
         self.files = []
         self.__see_what_files(self.data_dir)
         self.lazy = []
@@ -459,7 +462,7 @@ class lasCatalogue:
 
             pipeline.execute()
 
-        # build a vrt from overlaping chm  tiles
+        # build a vrt from overlapping chm  tiles
         chm_vrt = os.path.join(save_dir, 'chm.vrt')
         _ = gdal.BuildVRT(chm_vrt, chm_vsi_hrefs)
         _ = None
@@ -473,93 +476,158 @@ class lasCatalogue:
             self.dem_path = dem_vrt
         
 
+    def filter_chm(self, ws, ws_in_pixels=False, circular=False, save_dir=None):
+        ''' Pre-process the canopy height model (smoothing and outlier removal).
+        The original CHM (self.chm0) is not overwritten, but a new one is
+        stored (self.chm).
+        Parameters
+        ----------
+        ws :            int
+                        window size of smoothing filter in metre (set in_pixel=True, otherwise)
+        ws_in_pixels :  bool, optional
+                        sets ws in pixel
+        circular :      bool, optional
+                        set to True for disc-shaped filter kernel, block otherwise
+        save_dir :      str
+                        destination path to save smoothed chm
+        '''
+        if not ws_in_pixels:
+            if ws % self.resolution:
+                raise Exception("Image filter size not an integer number. Please check if image resolution matches filter size (in metre or pixel).")
+            else:
+                ws = int(ws / self.resolution)
+
+        # make place to save
+        if not save_dir:
+            # make a tmp directory that will be destroyed when we are done
+            self._smooth_tmp = tempfile.TemporaryDirectory()
+            save_dir = self._smooth_tmp.name 
+        os.makedirs(save_dir, exist_ok=True)
+        
+
+        # find all the chm tiles
+        tiles = [
+            os.path.join(self.chm_path, tile)
+            for tile
+            in os.listdir(self.chm_path)
+            if tile.endswith('.tif')]
+
+        vsi_hrefs = []
+
+        for tile in tiles:
+            # read raster as array
+            with rio.open(self.chm_path) as src:
+                chm0 = src.read()
+
+            # filter chm
+            chm = filters.median_filter(
+            chm0,
+            footprint=self._get_kernel(ws, circular=circular)
+            )
+
+            chm0[np.isnan(chm0)] = 0.
+            mask = (chm < 0.5) | np.isnan(chm) | (chm > 120.)
+            chm[mask] = 0
+
+            fname = os.path.join(save_dir, os.path.basename(tile))
+            vsi_hrefs.append(fname)
+
+            with rio.open(fname, 'w') as dst:
+                dst.write(chm.astype(rio.int32))
+                 
+        # build a vrt from overlapping chm  tiles
+        chm_vrt = os.path.join(save_dir, 'smooth_chm.vrt')
+        _ = gdal.BuildVRT(chm_vrt, vsi_hrefs)
+        _ = None
+        self.smooth_chm_path = chm_vrt
+
+
     def tree_detection(self, raster=None, resolution=None, ws=10, hmin=3,
                         return_trees=False, ws_in_pixels=False):
-            ''' Detect individual trees from CHM raster based on a maximum filter.
-            Identified trees are either stores as list in the tree dataframe or
-            returned as ndarray.
-            Parameters
-            ----------
-            raster :        str, optional
-                            path to raster of height values (e.g., CHM)
-            resolution :    int, optional
-                            resolution of raster in m
-            ws :            float
-                            moving window size (in metre) to detect the local maxima
-            hmin :          float
-                            Minimum height of a tree. Threshold below which a pixel
-                            or a point cannot be a local maxima
-            return_trees :  bool
-                            set to True if detected trees shopuld be returned as
-                            ndarray instead of being stored in tree dataframe
-            ws_in_pixels :  bool
-                            sets ws in pixel
-            Returns
-            -------
-            ndarray (optional)
-                nx2 array of tree top pixel coordinates
+        ''' Detect individual trees from CHM raster based on a maximum filter.
+        Identified trees are either stores as list in the tree dataframe or
+        returned as ndarray.
+        Parameters
+        ----------
+        raster :        str, optional
+                        path to raster of height values (e.g., CHM)
+        resolution :    int, optional
+                        resolution of raster in m
+        ws :            float
+                        moving window size (in metre) to detect the local maxima
+        hmin :          float
+                        Minimum height of a tree. Threshold below which a pixel
+                        or a point cannot be a local maxima
+        return_trees :  bool
+                        set to True if detected trees shopuld be returned as
+                        ndarray instead of being stored in tree dataframe
+        ws_in_pixels :  bool
+                        sets ws in pixel
+        Returns
+        -------
+        ndarray (optional)
+            nx2 array of tree top pixel coordinates
 
-            Modified fom:
-            Zörner, J.; Dymond, J.; Shepherd J.; Jolly, B.
-            PyCrown - Fast raster-based individual tree segmentation for LiDAR data.
-            Landcare Research NZ Ltd. 2018, https://doi.org/10.7931/M0SR-DN55
-            '''
+        Modified fom:
+        Zörner, J.; Dymond, J.; Shepherd J.; Jolly, B.
+        PyCrown - Fast raster-based individual tree segmentation for LiDAR data.
+        Landcare Research NZ Ltd. 2018, https://doi.org/10.7931/M0SR-DN55
+        '''
 
-            # read raster as array
-            raster = raster if raster else self.chm_path
-            chm_gdal = gdal.Open(raster, gdal.GA_ReadOnly)  
-            raster = chm_gdal.GetRasterBand(1).ReadAsArray()
+        # read raster as array
+        raster = raster if raster else self.smooth_chm_path
+        chm_gdal = gdal.Open(raster, gdal.GA_ReadOnly)  
+        raster = chm_gdal.GetRasterBand(1).ReadAsArray()
 
+        # get geotransform
+        geotransform = chm_gdal.GetGeoTransform()
+        self.x_transform = geotransform[0]
+        self.y_transform = geotransform[3]
+        chm_gdal = None
 
-            # get geotransform
-            geotransform = chm_gdal.GetGeoTransform()
-            self.x_transform = geotransform[0]
-            self.y_transform = geotransform[3]
-            chm_gdal = None
+        # TODO: should we just read the resolution from the raster?
+        resolution = resolution if resolution else self.resolution
 
-            # TODO: should we just read the resolution from the raster?
-            resolution = resolution if resolution else self.resolution
+        if not ws_in_pixels:
+            if ws % resolution:
+                raise Exception("Image filter size not an integer number. Please check if image resolution matches filter size (in metre or pixel).")
+            else:
+                ws = int(ws / resolution)
 
-            if not ws_in_pixels:
-                if ws % resolution:
-                    raise Exception("Image filter size not an integer number. Please check if image resolution matches filter size (in metre or pixel).")
-                else:
-                    ws = int(ws / resolution)
+        # Maximum filter to find local peaks
+        raster_maximum = filters.maximum_filter(
+            raster,
+            footprint=self._get_kernel(ws, circular=True)
+            )
 
-            # Maximum filter to find local peaks
-            raster_maximum = filters.maximum_filter(
-                raster,
-                footprint=self._get_kernel(ws, circular=True)
-                )
+        tree_maxima = raster == raster_maximum
 
-            tree_maxima = raster == raster_maximum
+        # remove tree tops lower than minimum height
+        tree_maxima[raster <= hmin] = 0
 
-            # remove tree tops lower than minimum height
-            tree_maxima[raster <= hmin] = 0
+        # label each tree
+        self.tree_markers, num_objects = ndimage.label(tree_maxima)
 
-            # label each tree
-            self.tree_markers, num_objects = ndimage.label(tree_maxima)
+        if num_objects == 0:
+            raise NoTreesException
 
-            if num_objects == 0:
-                raise NoTreesException
+        # if canopy height is the same for multiple pixels,
+        # place the tree top in the center of mass of the pixel bounds
+        yx = np.array(
+                ndimage.center_of_mass(
+                    raster, self.tree_markers, range(1, num_objects+1)
+                ), dtype=np.float32
+            ) + 0.5
+        xy = np.array((yx[:, 1], yx[:, 0])).T
 
-            # if canopy height is the same for multiple pixels,
-            # place the tree top in the center of mass of the pixel bounds
-            yx = np.array(
-                    ndimage.center_of_mass(
-                        raster, self.tree_markers, range(1, num_objects+1)
-                    ), dtype=np.float32
-                ) + 0.5
-            xy = np.array((yx[:, 1], yx[:, 0])).T
+        trees = [Point(*self._pixel_to_geo(xy[tidx, 0], xy[tidx, 1], resolution))
+                for tidx in range(len(xy))]
 
-            trees = [Point(*self._pixel_to_geo(xy[tidx, 0], xy[tidx, 1], resolution))
-                    for tidx in range(len(xy))]
+        df = pd.DataFrame(np.array([trees, trees], dtype='object').T,
+                            dtype='object', columns=['top_cor', 'top'])
+        self.trees.append(df)
 
-            df = pd.DataFrame(np.array([trees, trees], dtype='object').T,
-                                dtype='object', columns=['top_cor', 'top'])
-            self.trees.append(df)
-
-            if return_trees:
-                return np.array(trees, dtype=object), xy
+        if return_trees:
+            return np.array(trees, dtype=object), xy
             
             

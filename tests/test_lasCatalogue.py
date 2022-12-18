@@ -79,6 +79,8 @@ t = time() - t
 print(f'It took {round(t/60, 2)} minutes to build chm and dem from bbox . ')
 
 
+ctg.filter_chm(5)
+
 ctg.tree_detection()
 
 t = time() - t
