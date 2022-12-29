@@ -36,6 +36,7 @@ from pathlib import Path
 import scipy.ndimage as ndimage
 import scipy.ndimage.filters as filters
 from scipy.spatial.distance import cdist
+from skimage.feature import peak_local_max
 
 from skimage.segmentation import watershed
 from skimage.filters import threshold_otsu
@@ -57,15 +58,16 @@ class NoTreesException(Exception):
 class lasCatalogue:
     '''docstring'''
 
-    def __init__(self, data_dir, tile_size=2000):
+    def __init__(self, data_dir, resolution=0.5, tile_size=2000):
         self.data_dir = data_dir
         self.parquet_dir = os.path.join(
             os.path.dirname(self.data_dir),
             'parquets')
         self.__inbox_func = None
+        self.resolution = resolution
         self.tile_size = tile_size
         self.buffer = 15
-        self.resolution = 0.5
+        self.srs = None
         self.chm_path = None
         self.dem_path = None
         self.smooth_chm_path = None
@@ -80,6 +82,7 @@ class lasCatalogue:
         
         for las in self.files():
             self.lazy.append(self.__las_to_parquet(las))
+
 
 
     def __read_las(self, las, hag=True):
@@ -104,6 +107,9 @@ class lasCatalogue:
             )
         n = pipeline.execute()
         arr = pipeline.arrays[0]
+
+        if not self.srs:
+            self.srs = pipeline.quickinfo['readers.las']['srs']['wkt']
 
         # make into df
         df = pd.DataFrame(arr)
@@ -370,13 +376,52 @@ class lasCatalogue:
         else:
             return np.ones((int(radius), int(radius)))
 
-
+    # TODO: get rid of self.x_ and y_transform, pass as args, make static method
     def _pixel_to_geo(self, pix_x, pix_y, resolution):
         ''' Convert pixel coordinates to projected coordinates
         '''
         x = self.x_transform + (pix_x * resolution)
         y = self.y_transform - (pix_y * resolution)
         return x, y
+
+
+    def _apply_filter(self, tile, ws, save_dir):
+        # read raster as array
+        chm_gdal = gdal.Open(tile, gdal.GA_ReadOnly)  
+        chm0 = chm_gdal.GetRasterBand(1).ReadAsArray()
+
+        # get geotransform
+        geotransform = chm_gdal.GetGeoTransform()
+        self.x_transform = geotransform[0]
+        self.y_transform = geotransform[3]
+        
+
+        # filter chm
+        chm = filters.median_filter(
+            chm0,
+            footprint=self._get_kernel(ws)
+            )
+
+        chm0[np.isnan(chm0)] = 0.
+        mask = (chm < 0.5) | np.isnan(chm) | (chm > 120.)
+        chm[mask] = 0
+
+        fname = os.path.join(save_dir, os.path.basename(tile))
+        self.vsi_hrefs.append(fname)
+
+        driver = gdal.GetDriverByName("GTiff")
+        [rows, cols] = chm.shape
+        outdata = driver.Create(fname, cols, rows, 1, gdal.GDT_Float32)
+        outdata.SetGeoTransform(chm_gdal.GetGeoTransform())
+        outdata.SetProjection(chm_gdal.GetProjection())
+        outdata.GetRasterBand(1).WriteArray(chm)
+        outdata.GetRasterBand(1).SetNoDataValue(-9999)
+
+        outdata = None
+        chm_gdal = None
+        chm0 = None
+
+
     # -------------------- public methods ------------------------------------
 
     def make_parquets(self):
@@ -398,7 +443,7 @@ class lasCatalogue:
         files = self.__find_needed_parquets(bbox)
         df = self.read_parquet(files)
 
-        func = self. __make_inbox_func(bbox)
+        func = self.__make_inbox_func(bbox)
 
         arr = df[['X', 'Y']].to_numpy()
         mask = func(arr[:,0], arr[:,1])
@@ -416,6 +461,8 @@ class lasCatalogue:
         buf_tiles = self.__buffer_tiles(bbox)
 
         # make place to save
+        shutil.rmtree(save_dir, ignore_errors=True)
+
         if not save_dir:
             # make a tmp directory that will be destroyed when we are done
             self._chm_tmp = tempfile.TemporaryDirectory()
@@ -426,12 +473,14 @@ class lasCatalogue:
         chm_vsi_hrefs = []
 
         if make_dem:
-                if not dem_dir:
-                    # make a tmp directory that will be destroyed when we are done
-                    self._dem_tmp = tempfile.TemporaryDirectory()
-                    dem_dir = self._dem_tmp.name 
-                os.makedirs(dem_dir, exist_ok=True)
-                dem_vsi_hrefs = []
+            shutil.rmtree(dem_dir, ignore_errors=True)
+
+            if not dem_dir:
+                # make a tmp directory that will be destroyed when we are done
+                self._dem_tmp = tempfile.TemporaryDirectory()
+                dem_dir = self._dem_tmp.name 
+            os.makedirs(dem_dir, exist_ok=True)
+            dem_vsi_hrefs = []
 
         for i, tile in enumerate(buf_tiles):
             # read points in tile
@@ -447,6 +496,7 @@ class lasCatalogue:
                 resolution=self.resolution,
                 output_type='mean',
                 dimension='HeightAboveGround',
+                override_srs=self.srs,
                 window_size=5
                 ).pipeline(arr)
             if make_dem:
@@ -457,6 +507,7 @@ class lasCatalogue:
                     filename=filename,
                     resolution=self.resolution,
                     output_type='mean',
+                    override_srs=self.srs,
                     window_size=5
                     )
 
@@ -476,7 +527,7 @@ class lasCatalogue:
             self.dem_path = dem_vrt
         
 
-    def filter_chm(self, ws, ws_in_pixels=False, circular=False, save_dir=None):
+    def filter_chm(self, ws, ws_in_pixels=False, circular=True, save_dir=None, use_dask=True):
         ''' Pre-process the canopy height model (smoothing and outlier removal).
         The original CHM (self.chm0) is not overwritten, but a new one is
         stored (self.chm).
@@ -498,59 +549,152 @@ class lasCatalogue:
                 ws = int(ws / self.resolution)
 
         # make place to save
+        shutil.rmtree(save_dir, ignore_errors=True)
+
         if not save_dir:
             # make a tmp directory that will be destroyed when we are done
             self._smooth_tmp = tempfile.TemporaryDirectory()
             save_dir = self._smooth_tmp.name 
         os.makedirs(save_dir, exist_ok=True)
         
-
         # find all the chm tiles
+
+        chm_dir = os.path.dirname(self.chm_path)
         tiles = [
-            os.path.join(self.chm_path, tile)
+            os.path.join(chm_dir, tile)
             for tile
-            in os.listdir(self.chm_path)
+            in os.listdir(chm_dir)
             if tile.endswith('.tif')]
 
-        vsi_hrefs = []
+        self.vsi_hrefs = []
 
-        for tile in tiles:
-            # read raster as array
-            with rio.open(self.chm_path) as src:
-                chm0 = src.read()
+        if use_dask:
 
-            # filter chm
-            chm = filters.median_filter(
-            chm0,
-            footprint=self._get_kernel(ws, circular=circular)
-            )
+            lazy = []
 
-            chm0[np.isnan(chm0)] = 0.
-            mask = (chm < 0.5) | np.isnan(chm) | (chm > 120.)
-            chm[mask] = 0
+            for tile in tiles:
+                lazy.append(delayed(self._apply_filter)(tile, ws, save_dir))
 
-            fname = os.path.join(save_dir, os.path.basename(tile))
-            vsi_hrefs.append(fname)
+            with ProgressBar():
+                compute(*lazy)
 
-            with rio.open(fname, 'w') as dst:
-                dst.write(chm.astype(rio.int32))
+        else:
+            for tile in tqdm(tiles):
+                self._apply_filter(tile, ws, save_dir)
                  
         # build a vrt from overlapping chm  tiles
         chm_vrt = os.path.join(save_dir, 'smooth_chm.vrt')
-        _ = gdal.BuildVRT(chm_vrt, vsi_hrefs)
+        _ = gdal.BuildVRT(chm_vrt, self.vsi_hrefs)
         _ = None
         self.smooth_chm_path = chm_vrt
 
 
-    def tree_detection(self, raster=None, resolution=None, ws=10, hmin=3,
-                        return_trees=False, ws_in_pixels=False):
+    def tree_detection(
+        self,
+        raster=None,
+        resolution=None,
+        ws=1,
+        hmin=3,
+        return_trees=False,
+        use_unsmoothed_chm=False
+    ):
+        '''
+        Detect individual trees from CHM raster based on skimage.feature
+        peak_local_max. Identified trees are either stores as list in the tree dataframe or
+        returned as ndarray.
+        Parameters
+        ----------
+        raster :        str, optional
+                        path to raster of height values (e.g., CHM).
+                        Tries to use the smoothed chm if omitted.
+        resolution :    int, optional
+                        resolution of raster in m
+        ws :            float
+                        moving window size (in meters) to detect the local maxima
+        hmin :          float
+                        Minimum height of a tree. Threshold below which a pixel
+                        or a point cannot be a local maxima
+        return_trees :  bool
+                        set to True if detected trees should be returned as
+                        dataframe. Otherwise will be stored as self.trees
+       
+        Returns
+        -------
+        ndarray (optional)
+            nx2 array of tree top pixel coordinates
+
+        Returns
+        -------
+        Geopandas Geodatframe (optional)
+            dataframe of tree top pixel coordinates
+        '''
+        resolution = resolution if resolution else self.resolution
+
+        # read raster as array
+        if use_unsmoothed_chm:
+            raster= self.chm_path
+
+        raster= raster if raster else self.smooth_chm_path
+        chm_gdal = gdal.Open(im, gdal.GA_ReadOnly)  
+        raster= chm_gdal.GetRasterBand(1).ReadAsArray()
+
+        # get geotransform
+        geotransform = chm_gdal.GetGeoTransform()
+        x_transform = geotransform[0]
+        y_transform = geotransform[3]
+        chm_gdal = None
+
+        # use skimage to find the coordinates of local maxima
+        tree_maxima = peak_local_max(im, min_distance=ws, indices=False)
+
+        # remove tree tops lower than minimum height
+        tree_maxima[raster <= hmin] = 0
+
+        # label each tree
+        tree_markers, num_objects = ndimage.label(tree_maxima)
+        
+        # if canopy height is the same for multiple pixels,
+        # place the tree top in the center of mass of the pixel bounds
+        yx = np.array(
+                ndimage.center_of_mass(
+                    raster, tree_markers, range(1, num_objects+1)
+                ), dtype=np.float32
+            ) + 0.5 * resolution
+        xy = np.array((yx[:, 1], yx[:, 0])).T
+
+        trees = [Point(*self._pixel_to_geo(xy[tidx, 0], xy[tidx, 1], resolution))
+            for tidx in range(len(xy))]
+
+        df = pd.DataFrame(np.array([trees, trees], dtype='object').T,
+                            dtype='object', columns=['top_cor', 'geometry'])
+
+        df = gpd.GeoDataFrame(df)
+        self.trees.append(df)
+
+        if return_trees:
+            return df
+
+
+
+
+    def tree_detection_old(
+        self,
+        raster=None,
+        resolution=None,
+        ws=10,
+        hmin=3,
+        return_trees=False,
+        ws_in_pixels=False,
+        use_unsmoothed_chm=False
+        ):
         ''' Detect individual trees from CHM raster based on a maximum filter.
         Identified trees are either stores as list in the tree dataframe or
         returned as ndarray.
         Parameters
         ----------
         raster :        str, optional
-                        path to raster of height values (e.g., CHM)
+                        path to raster of height values (e.g., CHM).
+                        Tries to use the smoothed chm if omitted.
         resolution :    int, optional
                         resolution of raster in m
         ws :            float
@@ -559,7 +703,7 @@ class lasCatalogue:
                         Minimum height of a tree. Threshold below which a pixel
                         or a point cannot be a local maxima
         return_trees :  bool
-                        set to True if detected trees shopuld be returned as
+                        set to True if detected trees should be returned as
                         ndarray instead of being stored in tree dataframe
         ws_in_pixels :  bool
                         sets ws in pixel
@@ -575,6 +719,9 @@ class lasCatalogue:
         '''
 
         # read raster as array
+        if use_unsmoothed_chm:
+            raster = self.chm_path
+
         raster = raster if raster else self.smooth_chm_path
         chm_gdal = gdal.Open(raster, gdal.GA_ReadOnly)  
         raster = chm_gdal.GetRasterBand(1).ReadAsArray()
@@ -624,10 +771,12 @@ class lasCatalogue:
                 for tidx in range(len(xy))]
 
         df = pd.DataFrame(np.array([trees, trees], dtype='object').T,
-                            dtype='object', columns=['top_cor', 'top'])
+                            dtype='object', columns=['top_cor', 'geometry'])
+
+        df = gpd.GeoDataFrame(df)
         self.trees.append(df)
 
         if return_trees:
-            return np.array(trees, dtype=object), xy
+            return df
             
             
